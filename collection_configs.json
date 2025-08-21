@@ -1,0 +1,55 @@
+{
+  "collections": [
+    {
+      "name": "Pixelady Maker CATA",
+      "chain": "abstract",
+      "reservoir_api_base_url": "https://api-abstract.reservoir.tools",
+      "contract_address": "0xeA56aBd80cc721e6ED38CC287a0770C65fB47394",
+      
+      "transaction_link_base": "https://abscan.org/tx/",
+      "poll_interval": 60,
+      "sales_limit": 50,
+      "activity_limit": 50,
+      "max_known_sales": 50,
+      "max_known_mints": 100,
+      "max_known_burns": 100,
+
+      "discord_sales_channel_id": 1337336996527345706,
+      "discord_mint_channel_id": 1337346627316355155,
+      "discord_burn_channel_id": 1337351464301101066,
+
+      "burn_address": "0x000000000000000000000000000000000000dEaD",
+      "zero_address": "0x0000000000000000000000000000000000000000",
+
+      "json_base_uri": "https://d1kgk9u8ytew77.cloudfront.net/ipfs/bafybeichlyfxwttpzeoc7exv4tjh6rv52psqnlrhhbsydwb4u6elsqp3n4",
+
+      "burn_messages": [
+        { "weight": 0.40, "message": "{tokenName} has been KIA!!!" },
+        { "weight": 0.30, "message": "{tokenName} has gone MIA!!!" },
+        { "weight": 0.10, "message": "{tokenName} has been NUKED!!! 💥" },
+        { "weight": 0.07, "message": "{tokenName} has been IRRADIATED!!!!!" },
+        { "weight": 0.06, "message": "{tokenName} has been EXPLODED BY A LOVE BOMB!!!" },
+        { "weight": 0.05, "message": "{tokenName} has been sent to hell!!!!!" },
+        { "weight": 0.02, "message": "{tokenName} has been sent to heaven!" }
+      ]
+    },
+    {
+      "name": "LAZY ARCANA CHAN",
+      "chain": "base",
+      "reservoir_api_base_url": "https://api-base.reservoir.tools",
+      "contract_address": "0x10D0Cd2cB262d7FE2e036838eA1139cce6eB5F48",
+      
+      "transaction_link_base": "https://basescan.org/tx/",
+      "poll_interval": 360,
+      "sales_limit": 50,
+      "activity_limit": 50,
+      "max_known_sales": 50,
+      "id_cooldown": 60,
+
+      "discord_sales_channel_id": 1391262375897993297,
+
+      "json_base_uri": "https://d1kgk9u8ytew77.cloudfront.net/ipfs/bafybeifj2thtmt5we6v2ylwrhiqzd4yglmgelj7d5kgzzurae7fccc2uum"
+
+    }
+  ]
+}
