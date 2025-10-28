@@ -1,6 +1,6 @@
 # Multi-Collection NFT Sales Bot
 
-A Discord bot that monitors and posts real-time NFT sales, mints, and burns for multiple collections across different blockchains. Supports Ethereum, Base, Abstract, and Polygon networks.
+A Discord bot that monitors and posts real-time NFT sales, mints, and burns for multiple collections across different blockchains.
 
 ## Features
 
@@ -472,7 +472,7 @@ multi-collection-sales-bot/
 ├── bot.py                      # Main bot application
 ├── collection_configs.json     # Collection configuration
 ├── requirements.txt            # Python dependencies
-├── sales_bot.service          # Systemd service file
+├── sales_bot.service          # Systemd service file (edit this)
 ├── discord_bot.token          # Discord bot token (create this)
 ├── opensea.token              # OpenSea API key (optional)
 ├── known_sales_*.txt          # Sales tracking (auto-generated)
