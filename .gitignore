@@ -1,4 +1,7 @@
 magic_eden_api.key
-reservoir_api.key
+opensea.token
 discord_bot.token
-reservoir_api.keys
+
+known_burns_*.txt
+known_mints_*.txt
+known_sales_*.txt

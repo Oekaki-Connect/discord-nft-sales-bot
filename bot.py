@@ -71,18 +71,20 @@ def load_file_secret(path):
     print("[DEBUG] Successfully loaded single secret.")
     return secret
 
-def load_file_secrets(path):
-    """Load multiple Reservoir API keys, one per line."""
-    print(f"[DEBUG] Loading multiple secrets from {path}")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Could not find file: {path}")
-    with open(path, "r") as f:
-        lines = [line.strip() for line in f if line.strip()]
-    print(f"[DEBUG] Successfully loaded {len(lines)} Reservoir API keys.")
-    return lines
-
-RESERVOIR_API_KEYS = load_file_secrets("reservoir_api.keys")
 DISCORD_BOT_TOKEN = load_file_secret("discord_bot.token")
+
+# OpenSea support is optional - only enable if API key file exists
+OPENSEA_ENABLED = False
+OPENSEA_API_KEY = None
+if os.path.exists("opensea.token"):
+    try:
+        OPENSEA_API_KEY = load_file_secret("opensea.token")
+        OPENSEA_ENABLED = True
+        print("[DEBUG] OpenSea API key loaded successfully. OpenSea support enabled.")
+    except Exception as e:
+        print(f"[DEBUG] Error loading OpenSea API key: {e}. OpenSea support disabled.")
+else:
+    print("[DEBUG] opensea.token file not found. OpenSea support disabled.")
 
 #################################
 # Load Collection Configs
@@ -112,6 +114,7 @@ token_id_cooldowns = {}  # contract -> {token_id -> timestamp}
 
 last_check_sales_timestamp = {}
 last_check_activity_timestamp = {}
+last_check_opensea_timestamp = {}
 
 def get_sales_file(contract_address):
     return f"known_sales_{contract_address}.txt"
@@ -122,6 +125,17 @@ def get_mints_file(contract_address):
 def get_burns_file(contract_address):
     return f"known_burns_{contract_address}.txt"
 
+def is_valid_id_format(line):
+    """Check if ID is in expected format: {tokenId}-{txHash}"""
+    if "-" not in line:
+        return False
+    parts = line.split("-", 1)  # Split on first hyphen only
+    if len(parts) != 2:
+        return False
+    token_id, tx_hash = parts
+    # Token ID should be numeric, tx hash should start with 0x
+    return token_id.isdigit() and tx_hash.startswith("0x")
+
 def load_ids(filename):
     print(f"[DEBUG] Loading IDs from {filename}")
     if not os.path.exists(filename):
@@ -129,8 +143,19 @@ def load_ids(filename):
         return []
     with open(filename, "r") as f:
         lines = [line.strip() for line in f if line.strip()]
-    print(f"[DEBUG] Loaded {len(lines)} IDs from {filename}")
-    return lines
+
+    # Keep only entries in the expected format: tokenId-0xHash
+    old_count = len(lines)
+    cleaned_lines = [line for line in lines if is_valid_id_format(line)]
+
+    if len(cleaned_lines) < old_count:
+        pruned_count = old_count - len(cleaned_lines)
+        print(f"[DEBUG] Pruned {pruned_count} invalid format entries from {filename}")
+        # Save the cleaned list back to file
+        save_ids(cleaned_lines, filename)
+
+    print(f"[DEBUG] Loaded {len(cleaned_lines)} IDs from {filename}")
+    return cleaned_lines
 
 def save_ids(ids_list, filename):
     print(f"[DEBUG] Saving {len(ids_list)} IDs to {filename}")
@@ -150,6 +175,7 @@ for coll in COLLECTIONS:
     now_ts = int(time.time())
     last_check_sales_timestamp[contract] = now_ts
     last_check_activity_timestamp[contract] = now_ts
+    last_check_opensea_timestamp[contract] = now_ts
 
 print("[DEBUG] Initialization complete.")
 
@@ -176,51 +202,73 @@ async def check_all_collections():
         # default poll_interval to 300 (5 mins) if not specified
         poll_interval = coll.get("poll_interval", 300)
 
-        # Check Sales if poll_interval has passed
-        if current_ts - last_check_sales_timestamp[contract] >= poll_interval:
-            print(f"[DEBUG] -> Checking Sales for: {coll_name}")
-            await check_sales_for_collection(coll)
-            last_check_sales_timestamp[contract] = current_ts
-
-        # Check Activity if poll_interval has passed
+        # Check Activities (sales, mints, burns) if poll_interval has passed
         if current_ts - last_check_activity_timestamp[contract] >= poll_interval:
-            print(f"[DEBUG] -> Checking Activity for: {coll_name}")
-            await check_activity_for_collection(coll)
-            last_check_activity_timestamp[contract] = current_ts
+            print(f"[DEBUG] -> Checking Activities for: {coll_name}")
+            await check_activities_for_collection(coll)
+            # Timestamp is updated inside check_activities_for_collection
+
+        # Check OpenSea sales if enabled, poll_interval has passed, and collection has opensea_collection_slug
+        if OPENSEA_ENABLED and current_ts - last_check_opensea_timestamp[contract] >= poll_interval:
+            if coll.get("opensea_collection_slug"):
+                print(f"[DEBUG] -> Checking OpenSea Sales for: {coll_name}")
+                await check_opensea_sales_for_collection(coll)
+                # Timestamp is updated inside check_opensea_sales_for_collection
 
     print("[DEBUG] check_all_collections() - Finished checking all collections.")
 
-async def check_sales_for_collection(coll_config):
+async def check_activities_for_collection(coll_config):
+    """
+    Check activities (sales, mints, burns) for a collection using Magic Eden API.
+    This replaces the old check_sales_for_collection and check_activity_for_collection.
+    """
     contract = coll_config["contract_address"].lower()
     coll_name = coll_config.get("name", "Unknown")
+    chain = coll_config.get("chain", "ethereum")
 
-    start_ts = last_check_sales_timestamp[contract]
-    end_ts = int(time.time())
+    # Get the last check timestamp (use activity timestamp for unified checking)
+    start_ts = last_check_activity_timestamp.get(contract, int(time.time()))
+    limit = coll_config.get("activity_limit", 50)
 
-    limit = coll_config.get("sales_limit", 50)
-    reservoir_base = coll_config["reservoir_api_base_url"].rstrip("/")
+    # Build Magic Eden API URL
+    base_url = "https://api-mainnet.magiceden.dev/v4/activity/nft"
     url = (
-        f"{reservoir_base}/sales/v6"
-        f"?contract={contract}"
-        f"&includeTokenMetadata=true"
-        f"&includeDeleted=true"
-        f"&sortBy=time"
-        f"&sortDirection=desc"
-        f"&startTimestamp={start_ts}"
-        f"&endTimestamp={end_ts}"
+        f"{base_url}"
+        f"?chain={chain}"
+        f"&activityTypes[]=TRADE"
+        f"&activityTypes[]=MINT"
+        f"&activityTypes[]=BURN"
+        f"&collectionId={contract}"
         f"&limit={limit}"
+        f"&sortBy=timestamp"
+        f"&sortDir=desc"
     )
 
-    print(f"[DEBUG][{coll_name}] check_sales_for_collection() - URL: {url}")
-    sales_data = await fetch_data(url)
-    sales = sales_data.get("sales", [])
-    print(f"[DEBUG][{coll_name}] Fetched {len(sales)} sales (before filtering).")
+    print(f"[DEBUG][{coll_name}] check_activities_for_collection() - URL: {url}")
+    activity_data = await fetch_data(url)
+    activities = activity_data.get("activities", [])
+    print(f"[DEBUG][{coll_name}] Fetched {len(activities)} activities (before filtering).")
 
-    sales.reverse()
+    # Filter by timestamp and reverse to process oldest first
+    start_iso = unix_to_iso(start_ts)
+    filtered_activities = [act for act in activities if act.get("timestamp", "") >= start_iso]
+    filtered_activities.reverse()
 
-    new_posted = False
+    print(f"[DEBUG][{coll_name}] Processing {len(filtered_activities)} activities after timestamp filter.")
+
+    # Process different activity types
+    await process_trade_activities(filtered_activities, coll_config)
+    await process_mint_activities(filtered_activities, coll_config)
+    await process_burn_activities(filtered_activities, coll_config)
+
+    # Update last check timestamp
+    last_check_activity_timestamp[contract] = int(time.time())
+
+async def process_trade_activities(activities, coll_config):
+    """Process TRADE activities (sales)."""
+    contract = coll_config["contract_address"].lower()
+    coll_name = coll_config.get("name", "Unknown")
     zero_addr = coll_config.get("zero_address", "0x0000000000000000000000000000000000000000").lower()
-
     sales_channel_id = coll_config.get("discord_sales_channel_id", 0)
     sales_channel = bot.get_channel(sales_channel_id) if sales_channel_id else None
 
@@ -229,13 +277,19 @@ async def check_sales_for_collection(coll_config):
     cooldown_seconds = cooldown_minutes * 60
 
     new_count = 0
-    for sale in sales:
-        from_addr = sale["from"].lower()
-        sale_id = sale["id"]
-        token_id = sale["token"].get("tokenId", "???")
+    new_posted = False
 
+    for act in activities:
+        if act.get("activityType") != "TRADE":
+            continue
+
+        from_addr = act.get("fromAddress", "").lower()
         if from_addr == zero_addr:
             continue
+
+        token_id = act.get("asset", {}).get("tokenId", "???")
+        tx_hash = act.get("transactionInfo", {}).get("transactionId", "noTxHash")
+        sale_id = f"{token_id}-{tx_hash}"
 
         # Check if token ID is in cooldown
         current_time = int(time.time())
@@ -254,7 +308,7 @@ async def check_sales_for_collection(coll_config):
             token_id_cooldowns[contract][token_id] = current_time
 
             if sales_channel:
-                embed = await build_sale_embed(sale, coll_config)
+                embed = await build_sale_embed_me(act, coll_config)
                 try:
                     await sales_channel.send(embed=embed)
                 except Exception as e:
@@ -267,107 +321,189 @@ async def check_sales_for_collection(coll_config):
     if new_posted:
         save_ids(known_sales[contract], get_sales_file(contract))
 
-async def check_activity_for_collection(coll_config):
+async def process_mint_activities(activities, coll_config):
+    """Process MINT activities."""
+    contract = coll_config["contract_address"].lower()
+    coll_name = coll_config.get("name", "Unknown")
+    mint_channel_id = coll_config.get("discord_mint_channel_id", 0)
+    mint_channel = bot.get_channel(mint_channel_id) if mint_channel_id else None
+
+    new_count = 0
+    new_posted = False
+
+    for act in activities:
+        if act.get("activityType") != "MINT":
+            continue
+
+        token_id = act.get("asset", {}).get("tokenId", "???")
+        tx_hash = act.get("transactionInfo", {}).get("transactionId", "noTxHash")
+        mint_id = f"{token_id}-{tx_hash}"
+
+        if mint_id not in known_mints[contract]:
+            known_mints[contract].append(mint_id)
+            max_mints = coll_config.get("max_known_mints", 100)
+            if len(known_mints[contract]) > max_mints:
+                known_mints[contract].pop(0)
+
+            if mint_channel:
+                try:
+                    embed = await build_mint_embed_me(act, coll_config)
+                    await mint_channel.send(embed=embed)
+                except Exception as e:
+                    print(f"[DEBUG][{coll_name}] Error sending mint embed: {e}")
+
+            new_count += 1
+            new_posted = True
+
+    print(f"[DEBUG][{coll_name}] New mints posted: {new_count}")
+    if new_posted:
+        save_ids(known_mints[contract], get_mints_file(contract))
+
+async def process_burn_activities(activities, coll_config):
+    """Process BURN activities."""
+    contract = coll_config["contract_address"].lower()
+    coll_name = coll_config.get("name", "Unknown")
+    burn_channel_id = coll_config.get("discord_burn_channel_id", 0)
+    burn_channel = bot.get_channel(burn_channel_id) if burn_channel_id else None
+
+    new_count = 0
+    new_posted = False
+
+    for act in activities:
+        if act.get("activityType") != "BURN":
+            continue
+
+        token_id = act.get("asset", {}).get("tokenId", "???")
+        tx_hash = act.get("transactionInfo", {}).get("transactionId", "noTxHash")
+        burn_id = f"{token_id}-{tx_hash}"
+
+        if burn_id not in known_burns[contract]:
+            known_burns[contract].append(burn_id)
+            max_burns = coll_config.get("max_known_burns", 100)
+            if len(known_burns[contract]) > max_burns:
+                known_burns[contract].pop(0)
+
+            if burn_channel:
+                try:
+                    embed = await build_burn_embed_me(act, coll_config)
+                    await burn_channel.send(embed=embed)
+                except Exception as e:
+                    print(f"[DEBUG][{coll_name}] Error sending burn embed: {e}")
+
+            new_count += 1
+            new_posted = True
+
+    print(f"[DEBUG][{coll_name}] New burns posted: {new_count}")
+    if new_posted:
+        save_ids(known_burns[contract], get_burns_file(contract))
+
+async def check_opensea_sales_for_collection(coll_config):
+    """Check OpenSea for sales events. Only tracks sales, not mints/burns."""
     contract = coll_config["contract_address"].lower()
     coll_name = coll_config.get("name", "Unknown")
 
-    start_ts = last_check_activity_timestamp[contract]
-    end_ts = int(time.time())
-    limit = coll_config.get("activity_limit", 50)
+    # Skip if no OpenSea slug configured
+    opensea_slug = coll_config.get("opensea_collection_slug")
+    if not opensea_slug:
+        return
 
-    reservoir_base = coll_config["reservoir_api_base_url"].rstrip("/")
-    url = (
-        f"{reservoir_base}/collections/activity/v6"
-        f"?collection={contract}"
-        f"&limit={limit}"
-        f"&sortBy=eventTimestamp"
-        f"&startTimestamp={start_ts}"
-        f"&endTimestamp={end_ts}"
-        f"&includeMetadata=true"
-    )
+    start_ts = last_check_opensea_timestamp.get(contract, int(time.time()))
+    limit = coll_config.get("sales_limit", 50)
 
-    print(f"[DEBUG][{coll_name}] check_activity_for_collection() - URL: {url}")
-    activity_data = await fetch_data(url)
-    activities = activity_data.get("activities", [])
-    print(f"[DEBUG][{coll_name}] Fetched {len(activities)} activity items (before filtering).")
+    # Build OpenSea API URL
+    base_url = "https://api.opensea.io/api/v2/events/collection"
+    url = f"{base_url}/{opensea_slug}?limit={limit}&event_type=sale"
 
-    activities.reverse()
+    print(f"[DEBUG][{coll_name}] check_opensea_sales_for_collection() - URL: {url}")
 
-    minted_posted = False
-    burned_posted = False
+    # Fetch with OpenSea API key
+    headers = {"accept": "application/json", "x-api-key": OPENSEA_API_KEY}
+    opensea_data = await fetch_data_with_headers(url, headers)
 
-    burn_addr = coll_config.get("burn_address", "0x000000000000000000000000000000000000dEaD").lower()
+    events = opensea_data.get("asset_events", [])
+    print(f"[DEBUG][{coll_name}] Fetched {len(events)} OpenSea events (before filtering).")
+
+    # Filter by timestamp and reverse to process oldest first
+    filtered_events = [evt for evt in events if evt.get("event_timestamp", 0) >= start_ts]
+    filtered_events.reverse()
+
+    print(f"[DEBUG][{coll_name}] Processing {len(filtered_events)} OpenSea sales after timestamp filter.")
+
+    await process_opensea_sale_events(filtered_events, coll_config)
+
+    # Update last check timestamp
+    last_check_opensea_timestamp[contract] = int(time.time())
+
+async def process_opensea_sale_events(events, coll_config):
+    """Process OpenSea sale events (event_type=sale)."""
+    contract = coll_config["contract_address"].lower()
+    coll_name = coll_config.get("name", "Unknown")
     zero_addr = coll_config.get("zero_address", "0x0000000000000000000000000000000000000000").lower()
+    sales_channel_id = coll_config.get("discord_sales_channel_id", 0)
+    sales_channel = bot.get_channel(sales_channel_id) if sales_channel_id else None
 
-    mint_channel_id = coll_config.get("discord_mint_channel_id", 0)
-    burn_channel_id = coll_config.get("discord_burn_channel_id", 0)
+    # Get cooldown period
+    cooldown_minutes = coll_config.get("id_cooldown", 60)
+    cooldown_seconds = cooldown_minutes * 60
 
-    mint_channel = bot.get_channel(mint_channel_id) if mint_channel_id else None
-    burn_channel = bot.get_channel(burn_channel_id) if burn_channel_id else None
+    new_count = 0
+    new_posted = False
 
-    mint_count = 0
-    burn_count = 0
+    for evt in events:
+        # Extract sale data from OpenSea format
+        # OpenSea uses "nft" field for asset info
+        nft = evt.get("nft")
+        if not nft:
+            continue  # Skip if no nft data
 
-    for act in activities:
-        act_type = act["type"]
+        token_id = nft.get("identifier", "???")
 
-        # MINT
-        if act_type == "mint":
-            token_id = act["token"].get("tokenId", "???")
-            tx_hash = act.get("txHash", "noTxHash")
-            mint_id = f"{token_id}-{tx_hash}"
+        # Transaction hash is a direct string field in OpenSea sale events
+        tx_hash = evt.get("transaction", "noTxHash")
 
-            if mint_id not in known_mints[contract]:
-                known_mints[contract].append(mint_id)
-                max_mints = coll_config.get("max_known_mints", 100)
-                if len(known_mints[contract]) > max_mints:
-                    known_mints[contract].pop(0)
+        sale_id = f"{token_id}-{tx_hash}"
 
-                if mint_channel:
-                    try:
-                        embed = await build_mint_embed(act, coll_config)
-                        await mint_channel.send(embed=embed)
-                    except Exception as e:
-                        print(f"[DEBUG][{coll_name}] Error sending mint embed: {e}")
+        # Seller and buyer are direct string fields in OpenSea sale events
+        seller = evt.get("seller", "")
+        if seller and seller.lower() == zero_addr:
+            continue
 
-                mint_count += 1
-                minted_posted = True
+        # Check if token ID is in cooldown
+        current_time = int(time.time())
+        last_sale_time = token_id_cooldowns[contract].get(token_id, 0)
+        if current_time - last_sale_time < cooldown_seconds:
+            print(f"[DEBUG][{coll_name}] Token ID {token_id} is in cooldown, skipping OpenSea sale")
+            continue
 
-        # BURN
-        elif act_type == "transfer" and act["toAddress"].lower() == burn_addr:
-            token_id = act["token"].get("tokenId", "???")
-            tx_hash = act.get("txHash", "noTxHash")
-            burn_id = f"{token_id}-{tx_hash}"
+        if sale_id not in known_sales[contract]:
+            known_sales[contract].append(sale_id)
+            max_known_sales = coll_config.get("max_known_sales", 50)
+            if len(known_sales[contract]) > max_known_sales:
+                known_sales[contract].pop(0)
 
-            if burn_id not in known_burns[contract]:
-                known_burns[contract].append(burn_id)
-                max_burns = coll_config.get("max_known_burns", 100)
-                if len(known_burns[contract]) > max_burns:
-                    known_burns[contract].pop(0)
+            # Update token ID cooldown timestamp
+            token_id_cooldowns[contract][token_id] = current_time
 
-                if burn_channel:
-                    try:
-                        embed = await build_burn_embed(act, coll_config)
-                        await burn_channel.send(embed=embed)
-                    except Exception as e:
-                        print(f"[DEBUG][{coll_name}] Error sending burn embed: {e}")
+            if sales_channel:
+                embed = await build_opensea_sale_embed(evt, coll_config)
+                try:
+                    await sales_channel.send(embed=embed)
+                except Exception as e:
+                    print(f"[DEBUG][{coll_name}] Error sending OpenSea sale embed: {e}")
 
-                burn_count += 1
-                burned_posted = True
+            new_count += 1
+            new_posted = True
 
-    print(f"[DEBUG][{coll_name}] New mints posted: {mint_count}, new burns posted: {burn_count}")
-
-    if minted_posted:
-        save_ids(known_mints[contract], get_mints_file(contract))
-    if burned_posted:
-        save_ids(known_burns[contract], get_burns_file(contract))
+    print(f"[DEBUG][{coll_name}] New OpenSea sales posted: {new_count}")
+    if new_posted:
+        save_ids(known_sales[contract], get_sales_file(contract))
 
 #################################
 # Async-Safe Fetch
 #################################
 def sync_fetch_data(url):
-    chosen_key = random.choice(RESERVOIR_API_KEYS)
-    headers = {"accept": "*/*", "x-api-key": chosen_key}
+    # Magic Eden API doesn't require authentication
+    headers = {"accept": "*/*"}
     start_time = time.time()
     print(f"[DEBUG] (sync) sync_fetch_data() - Starting request to: {url[:200]}...")
 
@@ -386,23 +522,90 @@ async def fetch_data(url):
     """Run the blocking sync_fetch_data in a separate thread via asyncio.to_thread()."""
     return await asyncio.to_thread(sync_fetch_data, url)
 
-#################################
-# Embed Builders
-#################################
-async def build_sale_embed(sale, coll_config):
-    print(f"[DEBUG] build_sale_embed() - Building embed for sale ID: {sale.get('id')}")
-    token_data = sale["token"]
-    token_name = token_data.get("name", "Unknown Token")
-    token_image = token_data.get("image", "")
-    price_eth = sale["price"]["amount"]["decimal"]
-    price_usd = sale["price"]["amount"].get("usd", 0)
+def sync_fetch_data_with_headers(url, headers):
+    """Fetch data with custom headers (for OpenSea API)."""
+    start_time = time.time()
+    print(f"[DEBUG] (sync) sync_fetch_data_with_headers() - Starting request to: {url[:200]}...")
 
-    seller_address = sale["from"]
-    buyer_address = sale["to"]
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        elapsed = time.time() - start_time
+        print(f"[DEBUG] (sync) sync_fetch_data_with_headers() - Success. Status: {r.status_code}. Time: {elapsed:.2f}s")
+        return r.json()
+    except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[DEBUG] Error fetching data from {url}: {e} (Time: {elapsed:.2f}s)")
+        return {}
+
+async def fetch_data_with_headers(url, headers):
+    """Run sync_fetch_data_with_headers in a separate thread."""
+    return await asyncio.to_thread(sync_fetch_data_with_headers, url, headers)
+
+def sync_fetch_eth_price():
+    """Fetch current ETH/USD spot price from Coinbase."""
+    url = "https://api.coinbase.com/v2/prices/ETH-USD/spot"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        price = float(data.get("data", {}).get("amount", 0))
+        print(f"[DEBUG] Fetched ETH price: ${price:,.2f}")
+        return price
+    except Exception as e:
+        print(f"[DEBUG] Error fetching ETH price from Coinbase: {e}")
+        return 0.0
+
+async def fetch_eth_price():
+    """Async wrapper for fetching ETH price."""
+    return await asyncio.to_thread(sync_fetch_eth_price)
+
+def weighted_burn_message(burn_list, token_name):
+    r = random.random()
+    cumulative = 0.0
+    for item in burn_list:
+        weight = item["weight"]
+        msg = item["message"]
+        cumulative += weight
+        if r < cumulative:
+            return msg.replace("{tokenName}", token_name)
+    last_msg = burn_list[-1]["message"]
+    return last_msg.replace("{tokenName}", token_name)
+
+#################################
+# Magic Eden Embed Builders
+#################################
+async def build_sale_embed_me(activity, coll_config):
+    """Build Discord embed for Magic Eden TRADE activity."""
+    print(f"[DEBUG] build_sale_embed_me() - Building embed for activity ID: {activity.get('activityId')}")
+
+    asset = activity.get("asset", {})
+    token_name = asset.get("name", "Unknown Token")
+    token_id = asset.get("tokenId", "???")
+
+    # Get token image from mediaV2
+    media_v2 = asset.get("mediaV2", {})
+    main_media = media_v2.get("main", {})
+    token_image = main_media.get("uri", "")
+
+    # Get price information
+    unit_price = activity.get("unitPrice", {})
+    amount = unit_price.get("amount", {})
+    price_native = float(amount.get("native", 0))
+    fiat = amount.get("fiat", {})
+    price_usd = float(fiat.get("usd", 0))
+
+    # Get currency symbol
+    currency = unit_price.get("currency", {})
+    currency_symbol = currency.get("symbol", "ETH")
+
+    seller_address = activity.get("fromAddress", "")
+    buyer_address = activity.get("toAddress", "")
     seller_display = await get_ens_or_short(seller_address, coll_config.get("chain", "ethereum"))
     buyer_display = await get_ens_or_short(buyer_address, coll_config.get("chain", "ethereum"))
 
-    tx_hash = sale.get("txHash", "noTxHash")
+    tx_info = activity.get("transactionInfo", {})
+    tx_hash = tx_info.get("transactionId", "noTxHash")
     transaction_link_base = coll_config.get("transaction_link_base", "https://abscan.org/tx/")
     transaction_link = f"{transaction_link_base}{tx_hash}"
 
@@ -412,7 +615,7 @@ async def build_sale_embed(sale, coll_config):
     )
     embed.add_field(
         name="Price",
-        value=f"{price_eth:.5f} ETH (${price_usd:,.2f} USD)",
+        value=f"{price_native:.5f} {currency_symbol} (${price_usd:,.2f} USD)",
         inline=False
     )
     embed.add_field(name="Seller", value=seller_display, inline=True)
@@ -425,26 +628,33 @@ async def build_sale_embed(sale, coll_config):
     embed.set_footer(text="Powered by Oekaki.io")
     return embed
 
-async def build_mint_embed(activity, coll_config):
-    print(f"[DEBUG] build_mint_embed() - Building embed for activity: {activity.get('txHash')}")
+async def build_mint_embed_me(activity, coll_config):
+    """Build Discord embed for Magic Eden MINT activity."""
+    print(f"[DEBUG] build_mint_embed_me() - Building embed for activity: {activity.get('activityId')}")
 
-    token_data = activity["token"]
-    token_id = token_data.get("tokenId", "???")
-    token_name = token_data.get("tokenName")
+    asset = activity.get("asset", {})
+    token_id = asset.get("tokenId", "???")
+    token_name = asset.get("name")
 
     # If the token name is missing, "None", or "???", fallback to "{CollectionName} #{TokenId}"
     if not token_name or token_name.lower() in ("none", "???"):
-        # Use collection name + # + token_id
         token_name = f"{coll_config.get('name', 'Unknown Collection')} #{token_id}"
 
-    to_address = activity["toAddress"]
+    to_address = activity.get("toAddress", "")
     to_display = await get_ens_or_short(to_address, coll_config.get("chain", "ethereum"))
 
-    tx_hash = activity.get("txHash", "noTxHash")
+    tx_info = activity.get("transactionInfo", {})
+    tx_hash = tx_info.get("transactionId", "noTxHash")
     transaction_link_base = coll_config.get("transaction_link_base", "https://abscan.org/tx/")
     transaction_link = f"{transaction_link_base}{tx_hash}"
 
-    token_image_url = await fetch_token_image(token_id, coll_config)
+    # Try to get image from mediaV2 first, fallback to fetching from metadata
+    media_v2 = asset.get("mediaV2", {})
+    main_media = media_v2.get("main", {})
+    token_image_url = main_media.get("uri", "")
+
+    if not token_image_url:
+        token_image_url = await fetch_token_image(token_id, coll_config)
 
     embed = discord.Embed(
         title=f"{token_name} just minted!",
@@ -467,12 +677,13 @@ async def build_mint_embed(activity, coll_config):
     embed.set_footer(text="Powered by Oekaki.io")
     return embed
 
+async def build_burn_embed_me(activity, coll_config):
+    """Build Discord embed for Magic Eden BURN activity."""
+    print(f"[DEBUG] build_burn_embed_me() - Building embed for activity: {activity.get('activityId')}")
 
-async def build_burn_embed(activity, coll_config):
-    print(f"[DEBUG] build_burn_embed() - Building embed for activity: {activity.get('txHash')}")
-    token_data = activity["token"]
-    token_id = token_data.get("tokenId", "???")
-    token_name = token_data.get("tokenName") or f"Survivor #{token_id}"
+    asset = activity.get("asset", {})
+    token_id = asset.get("tokenId", "???")
+    token_name = asset.get("name") or f"Token #{token_id}"
 
     burn_messages = coll_config.get("burn_messages", [])
     if not burn_messages:
@@ -481,14 +692,21 @@ async def build_burn_embed(activity, coll_config):
         ]
     burn_title = weighted_burn_message(burn_messages, token_name)
 
-    from_address = activity["fromAddress"]
+    from_address = activity.get("fromAddress", "")
     from_display = await get_ens_or_short(from_address, coll_config.get("chain", "ethereum"))
 
-    tx_hash = activity.get("txHash", "noTxHash")
+    tx_info = activity.get("transactionInfo", {})
+    tx_hash = tx_info.get("transactionId", "noTxHash")
     transaction_link_base = coll_config.get("transaction_link_base", "https://abscan.org/tx/")
     transaction_link = f"{transaction_link_base}{tx_hash}"
 
-    token_image_url = await fetch_token_image(token_id, coll_config)
+    # Try to get image from mediaV2 first, fallback to fetching from metadata
+    media_v2 = asset.get("mediaV2", {})
+    main_media = media_v2.get("main", {})
+    token_image_url = main_media.get("uri", "")
+
+    if not token_image_url:
+        token_image_url = await fetch_token_image(token_id, coll_config)
 
     embed = discord.Embed(
         title=burn_title,
@@ -503,17 +721,65 @@ async def build_burn_embed(activity, coll_config):
     embed.set_footer(text="Powered by Oekaki.io")
     return embed
 
-def weighted_burn_message(burn_list, token_name):
-    r = random.random()
-    cumulative = 0.0
-    for item in burn_list:
-        weight = item["weight"]
-        msg = item["message"]
-        cumulative += weight
-        if r < cumulative:
-            return msg.replace("{tokenName}", token_name)
-    last_msg = burn_list[-1]["message"]
-    return last_msg.replace("{tokenName}", token_name)
+async def build_opensea_sale_embed(event, coll_config):
+    """Build Discord embed for OpenSea sale event (event_type=sale)."""
+    print(f"[DEBUG] build_opensea_sale_embed() - Building embed for OpenSea event")
+
+    # OpenSea uses "nft" field for asset info
+    nft = event.get("nft", {})
+    token_name = nft.get("name", "Unknown Token")
+    token_id = nft.get("identifier", "???")
+    token_image = nft.get("image_url") or nft.get("display_image_url", "")
+
+    # Get payment information
+    payment = event.get("payment", {})
+    quantity = payment.get("quantity", "0")
+    decimals = payment.get("decimals", 18)
+    symbol = payment.get("symbol", "ETH")
+
+    # Convert quantity from wei to native currency
+    try:
+        price_native = float(quantity) / (10 ** decimals) if quantity and quantity != "0" else 0.0
+    except:
+        price_native = 0.0
+
+    # Calculate USD price using Coinbase spot price for ETH/WETH
+    price_usd = 0.0
+    if price_native > 0 and symbol.upper() in ["ETH", "WETH"]:
+        eth_price = await fetch_eth_price()
+        if eth_price > 0:
+            price_usd = price_native * eth_price
+
+    # Seller and buyer are direct string fields in OpenSea sale events
+    seller_address = event.get("seller", "")
+    buyer_address = event.get("buyer", "")
+
+    seller_display = await get_ens_or_short(seller_address, coll_config.get("chain", "ethereum")) if seller_address else "Unknown"
+    buyer_display = await get_ens_or_short(buyer_address, coll_config.get("chain", "ethereum")) if buyer_address else "Unknown"
+
+    # Transaction is a direct string field
+    tx_hash = event.get("transaction", "noTxHash")
+    transaction_link_base = coll_config.get("transaction_link_base", "https://abscan.org/tx/")
+    transaction_link = f"{transaction_link_base}{tx_hash}"
+
+    embed = discord.Embed(
+        title=f"{token_name} has been sold!!!",
+        color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="Price",
+        value=f"{price_native:.5f} {symbol}" + (f" (${price_usd:,.2f} USD)" if price_usd > 0 else ""),
+        inline=False
+    )
+    embed.add_field(name="Seller", value=seller_display, inline=True)
+    embed.add_field(name="Buyer", value=buyer_display, inline=True)
+    embed.add_field(name="Transaction", value=f"[View on Explorer]({transaction_link})", inline=False)
+
+    if token_image:
+        embed.set_image(url=token_image)
+
+    embed.set_footer(text="Powered by Oekaki.io")
+    return embed
 
 #################################
 # Token Metadata Fetch
@@ -556,6 +822,26 @@ def shorten_address(address: str, chars=6) -> str:
         return address[:2 + chars] + "..." + address[-chars:]
     else:
         return address
+
+def iso_to_unix(iso_timestamp: str) -> int:
+    """Convert ISO 8601 timestamp to Unix timestamp (seconds)."""
+    from datetime import datetime
+    try:
+        dt = datetime.fromisoformat(iso_timestamp.replace('Z', '+00:00'))
+        return int(dt.timestamp())
+    except Exception as e:
+        print(f"[DEBUG] Error converting ISO timestamp {iso_timestamp}: {e}")
+        return 0
+
+def unix_to_iso(unix_timestamp: int) -> str:
+    """Convert Unix timestamp (seconds) to ISO 8601 format."""
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromtimestamp(unix_timestamp, tz=timezone.utc)
+        return dt.isoformat().replace('+00:00', 'Z')
+    except Exception as e:
+        print(f"[DEBUG] Error converting Unix timestamp {unix_timestamp}: {e}")
+        return ""
 
 random.seed(int(time.time()))
 

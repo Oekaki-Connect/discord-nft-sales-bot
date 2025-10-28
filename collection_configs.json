@@ -3,7 +3,7 @@
     {
       "name": "Pixelady Maker CATA",
       "chain": "abstract",
-      "reservoir_api_base_url": "https://api-abstract.reservoir.tools",
+      "opensea_collection_slug": "pixelady-maker-cata-abstract",
       "contract_address": "0xeA56aBd80cc721e6ED38CC287a0770C65fB47394",
       
       "transaction_link_base": "https://abscan.org/tx/",
@@ -32,24 +32,6 @@
         { "weight": 0.05, "message": "{tokenName} has been sent to hell!!!!!" },
         { "weight": 0.02, "message": "{tokenName} has been sent to heaven!" }
       ]
-    },
-    {
-      "name": "LAZY ARCANA CHAN",
-      "chain": "base",
-      "reservoir_api_base_url": "https://api-base.reservoir.tools",
-      "contract_address": "0x10D0Cd2cB262d7FE2e036838eA1139cce6eB5F48",
-      
-      "transaction_link_base": "https://basescan.org/tx/",
-      "poll_interval": 360,
-      "sales_limit": 50,
-      "activity_limit": 50,
-      "max_known_sales": 50,
-      "id_cooldown": 60,
-
-      "discord_sales_channel_id": 1391262375897993297,
-
-      "json_base_uri": "https://d1kgk9u8ytew77.cloudfront.net/ipfs/bafybeifj2thtmt5we6v2ylwrhiqzd4yglmgelj7d5kgzzurae7fccc2uum"
-
     }
   ]
 }
